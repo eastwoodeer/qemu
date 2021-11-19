@@ -11,6 +11,7 @@
 #include "sysemu/reset.h"
 #include "sysemu/kvm.h"
 #include "hw/sysbus.h"
+#include "hw/core/generic-loader.h"
 #include "hw/pci/pci.h"
 #include "hw/ppc/openpic.h"
 #include "hw/char/serial.h"
@@ -35,8 +36,13 @@
 #define RAM_SIZES_ALIGN            (64 * MiB)
 #define EPAPR_MAGIC                (0x65504150)
 #define CLK_FREQ_HZ (400UL * 1000UL * 1000UL)
+#define DTC_LOAD_PAD                0x1800000
+#define DTC_PAD_MASK                0xFFFFF
 
 #define TYPE_E600PLAT_MACHINE  MACHINE_TYPE_NAME("ppce600")
+
+static GenericLoaderState *loaders[10] = {0};
+static int loaders_index = 0;
 
 static void e600_ccsr_initfn(Object *obj)
 {
@@ -54,7 +60,7 @@ struct boot_info
 
 static void ppce600_cpu_reset(void *opaque)
 {
-    info_report("ppce600 cpu reset..");    
+    info_report("ppce600 cpu reset..");
     PowerPCCPU *cpu = opaque;
     CPUState *cs = CPU(cpu);
     CPUPPCState *env = &cpu->env;
@@ -121,6 +127,94 @@ static DeviceState *ppce600_init_mpic(PPCE600MachineState *pms,
 
     return dev;
 }
+
+typedef struct DeviceTreeParams {
+    PPCE600MachineState *machine;
+    hwaddr addr;
+    hwaddr kernel_base;
+    hwaddr kernel_size;
+    Notifier notifier;
+} DeviceTreeParams;
+
+
+static int ppce600_load_device_tree(PPCE600MachineState *pms,
+                                    hwaddr addr,
+                                    hwaddr kernel_base,
+                                    hwaddr kernel_size,
+                                    bool dry_run)
+{
+    /* MachineState *machine = MACHINE(pms); */
+    /* const PPCE600MachineClass *pmc = PPCE600_MACHINE_GET_CLASS(pms); */
+    int ret;
+    int fdt_size;
+    void *fdt;
+
+    error_report("-->> addr: %08lx", addr);
+
+    fdt = create_device_tree(&fdt_size);
+    if (fdt == NULL) {
+        return -1;
+    }
+
+    qemu_fdt_add_subnode(fdt, "/chosen");
+
+    if (kernel_base != -1ULL) {
+        qemu_fdt_setprop_cells(fdt, "/chosen", "qemu,boot-kernel",
+                                     kernel_base >> 32, kernel_base,
+                                     kernel_size >> 32, kernel_size);
+    }
+
+    for (int i = 0; i < loaders_index; i++) {
+        GenericLoaderState *s = loaders[i];
+        char name[32] = {0};
+        sprintf(name, "%s,%d", "loader", i);
+        char value[512] = {0};
+        sprintf(value, "%s@0x%08lx", s->file, s->addr);
+        qemu_fdt_setprop_string(fdt, "/chosen", name, value);
+    }
+
+    if (!dry_run) {
+        qemu_fdt_dumpdtb(fdt, fdt_size);
+        cpu_physical_memory_write(addr, fdt, fdt_size);
+    }
+    ret = fdt_size;
+    g_free(fdt);
+
+    return ret;
+}
+
+static void ppce600_reset_device_tree(void *opaque)
+{
+    DeviceTreeParams *p = opaque;
+    ppce600_load_device_tree(p->machine, p->addr,
+                             p->kernel_base, p->kernel_size,
+                             false);
+}
+
+static void ppce600_init_notify(Notifier *notifier, void *data)
+{
+    DeviceTreeParams *p = container_of(notifier, DeviceTreeParams, notifier);
+    ppce600_reset_device_tree(p);
+}
+
+static int ppce600_prep_device_tree(PPCE600MachineState *machine,
+                                    hwaddr addr,
+                                    hwaddr kernel_base,
+                                    hwaddr kernel_size)
+{
+    DeviceTreeParams *p = g_new(DeviceTreeParams, 1);
+    p->machine = machine;
+    p->addr = addr;
+    p->kernel_base = kernel_base;
+    p->kernel_size = kernel_size;
+
+    p->notifier.notify = ppce600_init_notify;
+    qemu_add_machine_init_done_notifier(&p->notifier);
+
+    /* Issue the device tree loader once, so that we get the size of the blob */
+    return ppce600_load_device_tree(machine, addr, kernel_base, kernel_size, true);
+}
+
 
 static void ppce600_init(MachineState *machine)
 {
@@ -309,8 +403,14 @@ static void ppce600_init(MachineState *machine)
         cur_base += kernel_size;
     }
 
+    hwaddr dt_base = (loadaddr + payload_size + DTC_LOAD_PAD) & ~DTC_PAD_MASK;
+    int dt_size = ppce600_prep_device_tree(pms, dt_base, kernel_base, kernel_size);
+
     boot_info = env->load_info;
     boot_info->entry = bios_entry;
+    boot_info->dt_base = dt_base;
+    boot_info->dt_size = dt_size;
+
     info_report("init done");
 }
 
@@ -321,10 +421,23 @@ static void e600plat_init(MachineState *machine)
     return;
 }
 
+static HotplugHandler *e600plat_machine_get_hotpug_handler(MachineState *machine, DeviceState *dev)
+{
+    if (object_dynamic_cast(OBJECT(dev), "loader")) {
+        GenericLoaderState *s = GENERIC_LOADER(dev);
+        loaders[loaders_index++] = s;
+        error_report("[%d]: %s", loaders_index, s->file);
+    }
+
+    return NULL;
+}
+
+
 static void e600plat_machine_class_init(ObjectClass *oc, void *data)
 {
     PPCE600MachineClass *pmc = PPCE600_MACHINE_CLASS(oc);
     MachineClass *mc = MACHINE_CLASS(oc);
+    mc->get_hotplug_handler = e600plat_machine_get_hotpug_handler;
 
     pmc->platform_bus_base = 0xf00000000ULL;
     pmc->platform_bus_size = 128 * MiB;

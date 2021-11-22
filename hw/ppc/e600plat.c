@@ -31,6 +31,7 @@
 #include "hw/irq.h"
 
 #define SERIAL0_REGS_OFFSET        0x4500ULL
+#define SERIAL1_REGS_OFFSET        0x4600ULL
 #define CCSRBAR_SIZE               0x00100000ULL
 #define MPIC_REGS_OFFSET           0x40000ULL
 #define RAM_SIZES_ALIGN            (64 * MiB)
@@ -321,6 +322,12 @@ static void ppce600_init(MachineState *machine)
         serial_mm_init(ccsr_addr_space, SERIAL0_REGS_OFFSET,
                        0, qdev_get_gpio_in(mpicdev, 42), 399193,
                        serial_hd(0), DEVICE_BIG_ENDIAN);
+    }
+
+    if (serial_hd(1)) {
+        serial_mm_init(ccsr_addr_space, SERIAL1_REGS_OFFSET,
+                       0, qdev_get_gpio_in(mpicdev, 42), 399193,
+                       serial_hd(1), DEVICE_BIG_ENDIAN);
     }
 
     /*
